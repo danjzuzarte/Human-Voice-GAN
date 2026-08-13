@@ -1,0 +1,53 @@
+# Dataset configuration
+#
+# Source: https://huggingface.co/datasets/jungjee/asvspoof5
+#
+# Structure (per the dataset's README):
+#   - Train (T):  flac_T_aa.tar .. flac_T_ae.tar   (5 shards, ~7.5GB each, ~37GB total, 182,357 utterances)
+#   - Dev   (D):  flac_D_aa.tar .. flac_D_ac.tar   (3 shards, ~6.7GB each,  ~20GB total, 142,134 utterances)
+#   - Eval  (E):  flac_E_aa.tar .. flac_E_aj.tar   (10 shards, ~8.5GB each, ~85GB total, 681,872 utterances)
+#   - Protocols:  ASVspoof5_protocols.tar (93MB) — contains the label/protocol TSVs
+#   - Codec info: ASVspoof5.codec.config.csv
+
+hf_repo_id: jungjee/asvspoof5
+hf_repo_type: dataset
+
+# Start with a subset of train rather than the full 182k-utterance set, so the
+# pipeline can be validated quickly. Bump `shards_to_download` up once it's
+# confirmed working end to end.
+splits:
+  train:
+    shard_pattern: "flac_T_a{letter}.tar"
+    available_shards: [a, b, c, d, e]
+    shards_to_download: [a]        # 1 of 5 shards (~7.5GB, ~36k utterances)
+    protocol_file: ASVspoof5.train.tsv
+  dev:
+    shard_pattern: "flac_D_a{letter}.tar"
+    available_shards: [a, b, c]
+    shards_to_download: [a]        # 1 of 3 shards, enough for validation during training
+    protocol_file: ASVspoof5.dev.track_1.tsv
+  # eval (E series, ~85GB) intentionally left unconfigured here — pull this only
+  # for the cross-/in-distribution robustness evaluation stage, and consider
+  # whether the full 681k-utterance set is needed or a stratified sample suffices.
+
+protocols_archive: ASVspoof5_protocols.tar
+codec_config_file: ASVspoof5.codec.config.csv
+
+# Best-effort default — verify against the real header before trusting this.
+protocol_columns:
+  - speaker_id
+  - filename
+  - gender
+  - codec
+  - attack_or_label   # for track 1: contains "bonafide" or an attack/system ID
+
+label_column: attack_or_label
+bonafide_value: bonafide
+
+paths:
+  # On Colab, point this at either /content (fast, ephemeral, wiped on disconnect)
+  # or a Drive-mounted path (slower, persists across sessions). See the setup
+  # notebook for guidance on which to use for which artifact.
+  raw_download_dir: /content/asvspoof5_raw
+  extracted_dir: /content/asvspoof5_extracted
+  persistent_dir: /content/drive/MyDrive/voice-gan/data   # protocols + features only
