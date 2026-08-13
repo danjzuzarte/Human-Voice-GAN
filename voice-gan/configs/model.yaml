@@ -1,0 +1,35 @@
+# Detector model & training config
+#
+# MVP choice: frozen wav2vec2 frontend + attentive-pooling/MLP head, not a
+# full AASIST graph-attention backbone. Reasoning: the frontend already
+# carries most of the discriminative signal, this head trains in minutes
+# once embeddings are cached, and it's a straightforward upgrade path to
+# AASIST later if accuracy demands it. Iteration speed matters more early
+# on than squeezing out the last EER points.
+
+frontend:
+  checkpoint: facebook/wav2vec2-base   # ~95M params. Swap to microsoft/wavlm-base to try WavLM instead — same interface.
+  freeze: true                          # MVP: don't fine-tune the frontend. Revisit only if the frozen-embedding ceiling isn't good enough.
+  target_sample_rate: 16000             # ASVspoof5 audio is already 16kHz per the dataset docs; dataset.py resamples defensively anyway.
+  max_duration_sec: 4.0                 # fixed-length crop/pad applied to the waveform before the frontend — keeps embeddings a fixed size (~200 frames) so caching/batching stays simple.
+
+classifier:
+  pooling: attentive                    # learned per-frame attention weights -> weighted sum, instead of naive mean pooling
+  mlp_hidden: 256
+  dropout: 0.2
+
+training:
+  batch_size: 64                        # embeddings are small once cached, so this can be large even on a T4
+  epochs: 15
+  learning_rate: 0.001
+  weight_decay: 0.01
+  val_fraction: 0.1                     # held out from the downloaded train shard for a quick in-loop validation signal
+  seed: 42
+  use_cached_embeddings: true           # strongly recommended — see training/extract_embeddings.py. Set false to run the frontend inline each step (slow, only useful once you start fine-tuning it).
+
+paths:
+  # Embeddings cache is per-session scratch, not something worth spending Drive
+  # quota on — regenerating it takes minutes, not hours. Only checkpoints
+  # (the actual trained model) go to Drive, where they persist.
+  embeddings_cache_dir: /content/asvspoof5_embeddings
+  checkpoint_dir: /content/drive/MyDrive/voice-gan/checkpoints/detector
