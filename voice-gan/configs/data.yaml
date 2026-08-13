@@ -7,7 +7,18 @@
 #   - Dev   (D):  flac_D_aa.tar .. flac_D_ac.tar   (3 shards, ~6.7GB each,  ~20GB total, 142,134 utterances)
 #   - Eval  (E):  flac_E_aa.tar .. flac_E_aj.tar   (10 shards, ~8.5GB each, ~85GB total, 681,872 utterances)
 #   - Protocols:  ASVspoof5_protocols.tar (93MB) — contains the label/protocol TSVs
-#   - Codec info: ASVspoof5.codec.config.csv
+#   - Codec info: ASVspoof5.codec.config.csv is referenced in the docs but doesn't
+#     actually exist in this HF mirror — data/download_asvspoof5.py treats it as
+#     optional and skips it gracefully if missing.
+#
+# NOTE on `protocol_columns` / `protocol_delimiter` below: confirmed against a real
+# run of ASVspoof5.train.tsv. Despite the .tsv extension, the file is
+# whitespace-delimited, not tab-delimited, and has 10 columns, not 5 — the setup
+# notebook's verification step auto-detects the delimiter, but `protocol_columns`
+# still needs to match the real column count or that step fails loudly (by design).
+# Column *names* below are inferred from the observed values, not from official
+# docs — columns 4/5/6/10 were always "-" in every row seen so far, so their real
+# purpose is unconfirmed. Re-verify if you need to be sure.
 
 hf_repo_id: jungjee/asvspoof5
 hf_repo_type: dataset
@@ -31,17 +42,25 @@ splits:
   # whether the full 681k-utterance set is needed or a stratified sample suffices.
 
 protocols_archive: ASVspoof5_protocols.tar
-codec_config_file: ASVspoof5.codec.config.csv
+codec_config_file: ASVspoof5.codec.config.csv   # not present in this HF mirror — see note above; leave as-is or set to null, the download script handles either
 
-# Best-effort default — verify against the real header before trusting this.
+# Confirmed against a real run — see the note at the top of this file.
+# Example real row: "D_0062 D_0000000001 F - - - AC1 A11 spoof -"
+protocol_delimiter: "\\s+"   # whitespace-delimited, not tab — read with engine="python"
 protocol_columns:
   - speaker_id
   - filename
   - gender
-  - codec
-  - attack_or_label   # for track 1: contains "bonafide" or an attack/system ID
+  - reserved_4            # always "-" in observed rows — purpose unconfirmed
+  - reserved_5            # always "-" in observed rows — purpose unconfirmed
+  - reserved_6            # always "-" in observed rows — purpose unconfirmed
+  - acoustic_condition    # e.g. AC1/AC2/AC3 for spoof rows, "-" for bonafide
+  - system_id             # e.g. A11/A16 attack/system ID for spoof rows, literal "bonafide" for real audio
+  - key                   # the actual label — "spoof" or "bonafide" — this is what label_column points to
+  - reserved_10           # always "-" in observed rows — purpose unconfirmed
 
-label_column: attack_or_label
+label_column: key
+system_id_column: system_id   # used for the attack-type breakdown in EDA, kept separate from label_column
 bonafide_value: bonafide
 
 paths:

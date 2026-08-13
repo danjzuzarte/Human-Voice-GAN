@@ -47,7 +47,11 @@ def _extract_tar(tar_path: Path, dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     print(f"[extract] {tar_path.name} -> {dest_dir} ...")
     with tarfile.open(tar_path) as tf:
-        tf.extractall(dest_dir)
+        try:
+            tf.extractall(dest_dir, filter="data")
+        except TypeError:
+            # Python < 3.12 doesn't support the `filter` kwarg
+            tf.extractall(dest_dir)
     print(f"[extract] done: {tar_path.name}")
 
 
