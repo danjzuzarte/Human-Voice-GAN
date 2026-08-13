@@ -8,6 +8,7 @@ Usage:
     python training/train_detector.py --data-config configs/data.yaml --model-config configs/model.yaml
 """
 import argparse
+import json
 import os
 import random
 import sys
@@ -24,16 +25,38 @@ from models.detector.classifier import Detector
 
 
 class CachedEmbeddingDataset(Dataset):
-    def __init__(self, cache_path: str):
-        data = torch.load(cache_path)
-        self.embeddings = data["embeddings"]
-        self.labels = data["labels"]
+    """Reads embeddings from the on-disk memory-mapped cache extract_embeddings.py
+    writes (`{prefix}_embeddings.dat` + `{prefix}_meta.json` + `{prefix}_labels.pt`)
+    rather than loading the whole split into RAM at once — the earlier
+    single-.pt-file, all-in-RAM format didn't scale past ~1 shard. `cache_prefix`
+    is the shared prefix, e.g. '.../train' for '.../train_embeddings.dat' etc."""
+
+    def __init__(self, cache_prefix: str):
+        with open(f"{cache_prefix}_meta.json") as f:
+            meta = json.load(f)
+        self.n = meta["n"]
+        self.frames = meta["frames"]
+        self.hidden_dim = meta["hidden_dim"]
+        dtype = np.float16 if meta["dtype"] == "float16" else np.float32
+        # mode="r": read-only, memory-mapped — the OS pages data in from disk
+        # on demand as __getitem__ touches it, instead of this process ever
+        # holding the whole split resident in RAM.
+        self.embeddings = np.memmap(
+            f"{cache_prefix}_embeddings.dat", dtype=dtype, mode="r",
+            shape=(self.n, self.frames, self.hidden_dim),
+        )
+        self.labels = torch.load(f"{cache_prefix}_labels.pt")
 
     def __len__(self):
-        return len(self.labels)
+        return self.n
 
     def __getitem__(self, idx):
-        return self.embeddings[idx], self.labels[idx]
+        # np.array(...) copies this ONE utterance's slice out of the memmap
+        # into an owned, writable array — memmap slices are read-only views
+        # and shouldn't be handed to torch/DataLoader collation directly.
+        # Only ~0.3MB materializes per item, not the whole split.
+        item = np.array(self.embeddings[idx], dtype=np.float32)
+        return torch.from_numpy(item), self.labels[idx]
 
 
 def set_seed(seed: int):
@@ -82,12 +105,12 @@ def main():
     print(f"[train] device: {device}")
 
     cache_dir = model_cfg["paths"]["embeddings_cache_dir"]
-    cache_path = os.path.join(cache_dir, "train_embeddings.pt")
-    if not os.path.exists(cache_path):
+    cache_prefix = os.path.join(cache_dir, "train")
+    if not os.path.exists(f"{cache_prefix}_meta.json"):
         raise FileNotFoundError(
-            f"{cache_path} not found — run training/extract_embeddings.py --split train first."
+            f"{cache_prefix}_meta.json not found — run training/extract_embeddings.py --split train first."
         )
-    full_dataset = CachedEmbeddingDataset(cache_path)
+    full_dataset = CachedEmbeddingDataset(cache_prefix)
     print(f"[train] loaded {len(full_dataset)} cached embeddings")
 
     val_fraction = train_cfg["val_fraction"]

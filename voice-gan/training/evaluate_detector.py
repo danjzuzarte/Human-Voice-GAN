@@ -42,12 +42,12 @@ def main():
     print(f"[evaluate] device: {device}")
 
     cache_dir = model_cfg["paths"]["embeddings_cache_dir"]
-    cache_path = os.path.join(cache_dir, f"{args.split}_embeddings.pt")
-    if not os.path.exists(cache_path):
+    cache_prefix = os.path.join(cache_dir, args.split)
+    if not os.path.exists(f"{cache_prefix}_meta.json"):
         raise FileNotFoundError(
-            f"{cache_path} not found — run training/extract_embeddings.py --split {args.split} first."
+            f"{cache_prefix}_meta.json not found — run training/extract_embeddings.py --split {args.split} first."
         )
-    dataset = CachedEmbeddingDataset(cache_path)
+    dataset = CachedEmbeddingDataset(cache_prefix)
     print(f"[evaluate] loaded {len(dataset)} cached '{args.split}' embeddings")
 
     checkpoint_path = args.checkpoint or os.path.join(model_cfg["paths"]["checkpoint_dir"], "detector_best.pt")
