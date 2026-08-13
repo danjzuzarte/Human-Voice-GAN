@@ -52,13 +52,26 @@ def _extract_tar(tar_path: Path, dest_dir: Path) -> None:
 
 
 def download_protocols(cfg: dict) -> Path:
-    """Download and extract the protocols tar (small — ~93MB) + codec config csv."""
+    """Download and extract the protocols tar (small — ~93MB), plus the codec
+    config csv if the configured repo actually has one. Not every ASVspoof5
+    mirror ships this file, and its absence shouldn't block getting the
+    protocols (the actual labels) downloaded and extracted."""
     repo_id = cfg["hf_repo_id"]
     repo_type = cfg["hf_repo_type"]
     raw_dir = cfg["paths"]["raw_download_dir"]
 
     protocols_tar = _download_file(repo_id, repo_type, cfg["protocols_archive"], raw_dir)
-    _download_file(repo_id, repo_type, cfg["codec_config_file"], raw_dir)
+
+    codec_config_file = cfg.get("codec_config_file")
+    if codec_config_file:
+        try:
+            _download_file(repo_id, repo_type, codec_config_file, raw_dir)
+        except Exception as e:
+            print(
+                f"[protocols] Note: '{codec_config_file}' isn't in this HF repo "
+                f"({type(e).__name__}) — skipping it. It's not required to proceed; "
+                "set codec_config_file to null in configs/data.yaml to silence this."
+            )
 
     extracted = Path(cfg["paths"]["extracted_dir"]) / "protocols"
     _extract_tar(protocols_tar, extracted)
