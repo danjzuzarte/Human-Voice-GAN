@@ -10,11 +10,13 @@ Usage:
 import argparse
 import os
 import random
+import sys
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.dataset import load_configs
 from eval.metrics import compute_eer

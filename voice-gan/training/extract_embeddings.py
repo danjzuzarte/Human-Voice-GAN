@@ -14,10 +14,12 @@ Usage:
 """
 import argparse
 import os
+import sys
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.dataset import ASVspoof5Dataset, load_configs
 from models.detector.frontend import SpeechFrontend
