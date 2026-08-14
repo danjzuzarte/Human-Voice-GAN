@@ -2,10 +2,18 @@
 Thin wrapper around the pretrained F5-TTS zero-shot voice-cloning model
 (github.com/SWivid/F5-TTS, checkpoint via Hugging Face `SWivid/F5-TTS`).
 
-MVP: no fine-tuning, just off-the-shelf inference — clone a
-reference speaker's voice and have it say new text, to get a baseline
-"how detectable is an off-the-shelf generator" number against the trained
-detector. See ARCHITECTURE.md for the full roadmap.
+MVP: off-the-shelf inference — clone a reference speaker's voice and have it
+say new text, to get a baseline "how detectable is an off-the-shelf
+generator" number against the trained detector. See ARCHITECTURE.md for the
+full roadmap.
+
+`transformer_checkpoint` lets this wrapper load an adversarially-fine-tuned
+transformer (see training/finetune_generator.py,
+models/generator/f5_tts_finetune.py) on top of the pretrained base, so a
+given round's hardened generator can be evaluated with F5-TTS's own
+full-quality 32-step inference path — the differentiable few-step sampler
+used during training (models/generator/differentiable_sampling.py) is only
+for backprop, never for the audio that actually gets scored/listened to.
 
 The `f5-tts` package (`pip install f5-tts`) is imported lazily inside
 `GeneratorWrapper.__init__`, not at module load time, so this file can be
@@ -26,11 +34,21 @@ class GeneratorWrapper:
     natively outputs (24kHz as of the v1 base checkpoint) to match the
     detector's expected input rate."""
 
-    def __init__(self, model_name: str = "F5TTS_v1_Base", target_sample_rate: int = 16000, device: "str | None" = None):
+    def __init__(
+        self,
+        model_name: str = "F5TTS_v1_Base",
+        target_sample_rate: int = 16000,
+        device: "str | None" = None,
+        transformer_checkpoint: "str | None" = None,
+    ):
         from f5_tts.api import F5TTS  # lazy import — see module docstring
 
         self.target_sample_rate = target_sample_rate
         self._f5tts = F5TTS(model=model_name, device=device)
+
+        if transformer_checkpoint is not None:
+            state_dict = torch.load(transformer_checkpoint, map_location=device)
+            self._f5tts.ema_model.transformer.load_state_dict(state_dict)
 
     def clone(self, ref_audio_path: str, gen_text: str, ref_text: str = "", output_path: "str | None" = None) -> torch.Tensor:
         """ref_text="" (the default) triggers F5-TTS's built-in ASR step to

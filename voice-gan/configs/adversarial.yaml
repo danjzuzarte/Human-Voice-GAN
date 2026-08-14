@@ -1,0 +1,52 @@
+# Adversarial loop config
+#
+# Two independent sections, one per LangGraph node:
+#   generator_finetuning: training/finetune_generator.py  (harden_generator)
+#   detector_hardening:   training/harden_detector.py      (harden_detector)
+#
+# `seed` at the top level is shared (offset by `--round` in both scripts, so
+# each round draws a different but reproducible sample).
+
+seed: 42
+
+generator_finetuning:
+  # Reference/generation audio lengths — fixed constants, not per-item
+  # variable, because differentiable_sample only supports a single shared
+  # cond_seq_len per batch (see models/generator/differentiable_sampling.py
+  # docstring for why: batching through a custom Euler-step loop, unlike
+  # F5-TTS's own sampler, doesn't handle per-item variable lengths).
+  reference_duration_sec: 3.0
+  generation_duration_sec: 3.0
+
+  nfe_step: 8            # ODE steps for the differentiable sampler — small on purpose, see differentiable_sampling.py (GPU memory scales with this)
+  batch_size: 4           # keeps the full `nfe_step`-deep autograd graph tractable on a single Colab GPU
+  generator_lr: 0.00001   # small — fine-tuning a pretrained transformer, not training from scratch
+  anchor_weight: 1.0      # weight on the frozen-reference distillation loss relative to the adversarial BCE loss; see finetune_generator.py module docstring
+  adversarial_steps: 200  # optimizer steps per round, not epochs — there's no fixed "dataset size" here, batches are sampled fresh each step
+  max_grad_norm: 1.0
+
+detector_hardening:
+  # How many fresh hard-negative clips this round's fine-tuned generator
+  # produces (via GeneratorWrapper's normal full-quality 32-step inference —
+  # NOT the differentiable sampler, which is training-only for the generator
+  # side; see f5_tts_wrapper.py docstring) to mix into classifier-head
+  # training.
+  n_hard_negatives: 40
+  reference_split: dev      # same split generate_samples.py uses — dev bonafide references, disjoint from the train split the detector's original weights were trained on
+
+  # Real-embedding "replay" mixed in alongside the fresh hard negatives so
+  # hardening against this round's generator doesn't overwrite what the
+  # detector already learned from the original ASVspoof5 train set
+  # (catastrophic forgetting) — sampled from the same cached embeddings
+  # train_detector.py used, per model.yaml `paths.embeddings_cache_dir`.
+  n_replay_real: 400
+
+  epochs: 5
+  batch_size: 32
+  learning_rate: 0.0005     # smaller than the original from-scratch 0.001 — this is incremental hardening of an already-trained head, not training from scratch
+  val_fraction: 0.15
+  fooling_rate_threshold: 0.5   # not used by harden_detector.py itself — this is the conditional-routing threshold graph/nodes.py reads to decide harden_detector vs harden_generator next round; kept here so both nodes' knobs live in one file
+
+paths:
+  hard_negatives_dir: /content/asvspoof5_hard_negatives   # local/ephemeral, like generator.yaml's output_dir — regenerated fresh every round
+  generator_checkpoint_dir: /content/drive/MyDrive/voice-gan/checkpoints/generator
