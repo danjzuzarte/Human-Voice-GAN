@@ -1,0 +1,26 @@
+# Install with: pip install -r requirements.txt
+# On Colab, torch/torchaudio are usually preinstalled with CUDA support —
+# don't reinstall them unless a version check says otherwise.
+
+huggingface_hub>=0.24
+datasets>=2.20
+torch>=2.2
+torchaudio>=2.2
+transformers>=4.42
+pandas>=2.0
+numpy>=1.26
+soundfile>=0.12
+librosa>=0.10
+matplotlib>=3.8
+pyyaml>=6.0
+tqdm>=4.66
+scikit-learn>=1.3
+
+# Generator (voice cloning) — pretrained F5-TTS checkpoint:
+f5-tts
+
+# Adversarial training loop orchestration. Pinned >=1.0 deliberately — the
+# interrupt/resume API used in graph/ (dynamic interrupt() + Command(resume=...))
+# differs from older <1.0 releases' static interrupt_before=[...] API.
+langgraph>=1.0
+langgraph-checkpoint-sqlite>=2.0
