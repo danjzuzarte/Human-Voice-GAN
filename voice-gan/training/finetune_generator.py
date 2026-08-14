@@ -188,6 +188,7 @@ def main():
             steps=adv_cfg["nfe_step"], reference_transformer=reference_transformer,
         )
         generated_mel = mel[:, cond_seq_len:, :].permute(0, 2, 1)
+        generated_mel = generated_mel.to(torch.float32)
         generated_wave = vocoder.decode(generated_mel)  # [batch, samples] at native_sr, gradient-tracked
 
         batch = generated_wave.shape[0]
