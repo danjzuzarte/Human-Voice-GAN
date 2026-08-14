@@ -168,7 +168,18 @@ def main():
     generation_duration_sec = adv_cfg["generation_duration_sec"]
 
     from f5_tts.infer.utils_infer import hop_length
-    duration = int(generation_duration_sec * native_sr / hop_length)
+    # CFM.sample() (and differentiable_sample(), which mirrors its contract exactly)
+    # treats `duration` as the TOTAL target mel-frame length — reference frames PLUS
+    # generated frames, not generated frames alone (confirmed in the installed
+    # f5_tts.model.cfm source: `duration = max(max(text_len, lens) + 1, duration)`,
+    # where `lens` is the reference conditioning length — under-supplying duration
+    # just clamps up to lens+1, generating almost nothing). Found on a real GPU run:
+    # with reference_duration_sec == generation_duration_sec (both 3.0s), passing only
+    # the generation-portion frame count left duration ~= lens, so the generated slice
+    # collapsed to ~1 frame and crashed Vocos's istft on an effectively empty spectrogram.
+    reference_frames = int(reference_duration_sec * native_sr / hop_length)
+    generation_frames = int(generation_duration_sec * native_sr / hop_length)
+    duration = reference_frames + generation_frames
 
     optimizer = torch.optim.AdamW(cfm_model.transformer.parameters(), lr=adv_cfg["generator_lr"])
     bce = nn.BCEWithLogitsLoss()
@@ -188,6 +199,14 @@ def main():
             steps=adv_cfg["nfe_step"], reference_transformer=reference_transformer,
         )
         generated_mel = mel[:, cond_seq_len:, :].permute(0, 2, 1)
+        # F5-TTS's load_model()/load_checkpoint() auto-casts the CFM transformer (and
+        # therefore this mel, produced by it) to float16 on any GPU with compute
+        # capability >= 7 (see utils_infer.load_checkpoint's dtype=None branch) — but
+        # the Vocos vocoder loaded by load_vocoder() is never cast and stays float32.
+        # F5-TTS's own real inference path (utils_infer.infer_batch_process) handles
+        # this exact mismatch with the same cast, right before handing the mel to the
+        # vocoder — confirmed by reading its source after this failed on a real GPU.
+        # .to() is autograd-differentiable, so this doesn't break the gradient path.
         generated_mel = generated_mel.to(torch.float32)
         generated_wave = vocoder.decode(generated_mel)  # [batch, samples] at native_sr, gradient-tracked
 
@@ -202,6 +221,18 @@ def main():
         adversarial_loss = bce(logits, target)
 
         total_loss = adversarial_loss + adv_cfg["anchor_weight"] * anchor_loss
+
+        # Defense-in-depth alongside forcing bfloat16 in load_f5tts_for_finetuning() (see
+        # that function's docstring for the real NaN failure this guards against): if a step
+        # somehow still produces a non-finite loss, skip the optimizer update entirely rather
+        # than let a single bad step poison AdamW's exp_avg/exp_avg_sq state for every
+        # remaining step in the round. zero_grad() clears whatever backward() computed so
+        # nothing non-finite lingers in .grad either.
+        if not torch.isfinite(total_loss):
+            print(f"[finetune-generator] step {step:03d}/{adv_cfg['adversarial_steps']} | "
+                  f"non-finite loss ({total_loss.item()}), skipping optimizer step")
+            optimizer.zero_grad()
+            continue
 
         optimizer.zero_grad()
         total_loss.backward()

@@ -55,6 +55,20 @@ def load_f5tts_for_finetuning(model_name: str = "F5TTS_v1_Base", device: "str | 
     cfm_model = load_model(
         model_cls, model_arc, ckpt_file, mel_spec_type, "", "euler", True, device
     )
+    # load_model()/load_checkpoint() auto-casts to float16 whenever dtype=None is passed
+    # (our case — mel_spec_type is "vocos", not "bigvgan") and the GPU supports it (compute
+    # capability >= 7). That's fine for F5-TTS's own inference-only usage, but this module
+    # exists specifically to enable real backprop through the transformer, and training in
+    # pure float16 with no gradient scaling is a well-known instability source: found on a
+    # real GPU run, adv_loss/anchor_loss went to NaN on step 2 (immediately after the first
+    # optimizer.step()) and stayed NaN for the rest of the round, since NaN in a single
+    # backward pass poisons AdamW's exp_avg/exp_avg_sq state permanently. Force bfloat16
+    # instead — same ~2x memory savings vs float32, but bf16 keeps float32's full exponent
+    # range (just less mantissa precision), so it doesn't share fp16's overflow fragility and
+    # needs no loss scaler. Requires real bf16 support (Ampere/Ada or newer, compute
+    # capability >= 8 — the A10G/L4/A100 runtimes Colab typically assigns all qualify); on an
+    # older T4 (compute 7.5) it still runs correctly via software emulation, just slower.
+    cfm_model = cfm_model.to(torch.bfloat16)
     return cfm_model, vocoder, mel_spec_type, target_sample_rate
 
 

@@ -19,7 +19,14 @@ generator_finetuning:
   generation_duration_sec: 3.0
 
   nfe_step: 8            # ODE steps for the differentiable sampler — small on purpose, see differentiable_sampling.py (GPU memory scales with this)
-  batch_size: 4           # keeps the full `nfe_step`-deep autograd graph tractable on a single Colab GPU
+  batch_size: 2           # keeps the full `nfe_step`-deep autograd graph tractable on a single Colab GPU.
+                           # Was 4 — dropped after a real ~22GB-GPU run OOM'd on step 2 (step 1 succeeded, then
+                           # AdamW's first optimizer.step() allocated its exp_avg/exp_avg_sq state — a one-time
+                           # ~2x-trainable-parameter memory jump — on top of an already-heavy resident set: the
+                           # trainable transformer, a full frozen reference copy for the anchor loss, F5-TTS's
+                           # Whisper ASR pipeline, and the gradient-tracked detector frontend. If 2 still OOMs,
+                           # drop nfe_step next (affects sampler fidelity more, so it's the second lever, not
+                           # the first) — see ARCHITECTURE.md for the earlier real-GPU bugs found on this path.
   generator_lr: 0.00001   # small — fine-tuning a pretrained transformer, not training from scratch
   anchor_weight: 1.0      # weight on the frozen-reference distillation loss relative to the adversarial BCE loss; see finetune_generator.py module docstring
   adversarial_steps: 200  # optimizer steps per round, not epochs — there's no fixed "dataset size" here, batches are sampled fresh each step
