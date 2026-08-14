@@ -1,0 +1,27 @@
+# generator (voice cloning) config
+#
+# MVP choice: a pretrained, off-the-shelf F5-TTS checkpoint (zero-shot voice
+# cloning via flow matching), not a fine-tuned model. The goal here is just a
+# baseline "how detectable is an off-the-shelf generator" number — see
+# ARCHITECTURE.md for the full roadmap.
+#
+# ASVspoof5's protocol files carry no text transcripts (confirmed against a
+# real run — protocol_columns has no text field), so F5-TTS's reference text is left
+# blank and auto-transcribed via its built-in ASR step, and the *target* text
+# to synthesize is drawn from a small fixed pool of generic sentences (see
+# `target_sentences_file`) rather than real ASVspoof5 content.
+
+model:
+  name: F5TTS_v1_Base       # auto-downloads from Hugging Face (SWivid/F5-TTS) on first use — no separate download step needed
+  target_sample_rate: 16000  # match the detector's expected input rate; F5-TTS's native output is resampled to this after generation
+
+cloning:
+  reference_split: dev       # which ASVspoof5 split's bonafide utterances to use as cloning references (dev, not train, so the generated set doesn't overlap anything the detector trained on)
+  n_speakers: 20              # number of distinct bonafide reference utterances to clone from — MVP baseline, not exhaustive
+  target_sentences_file: configs/generator_sentences.txt
+  seed: 42
+
+paths:
+  # Generated audio + manifest — local/ephemeral like the embeddings cache,
+  # not worth Drive quota (regenerating is a Colab-minutes cost, not data loss risk).
+  output_dir: /content/asvspoof5_generated
