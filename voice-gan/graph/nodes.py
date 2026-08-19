@@ -124,11 +124,15 @@ def human_review_node(state: dict) -> dict:
 
     Expected decision strings (case-insensitive, matched by prefix so
     "stop, this isn't converging" also works):
-      "continue"                 — keep looping for up to max_rounds more rounds
-      "continue, extend to N"    — also raises max_rounds to N first
+      "continue"                 — keep looping, but ONLY has anywhere to go if
+                                    max_rounds hasn't actually been exhausted yet
+                                    (e.g. this escalation was triggered by the
+                                    stuck-rounds check, not the round budget) —
+                                    see the no-op guard below
+      "continue, extend to N"    — also raises max_rounds to N first, so there's
+                                    real room to keep going
       "stop"                     — end the run here, keep the current checkpoints
-    Anything not starting with "stop" is treated as "continue" — see
-    graph/graph.py's route_after_human_review."""
+    Anything not starting with "stop" is treated as "continue" — see graph/graph.py's route_after_human_review.
     from langgraph.types import interrupt
 
     decision = interrupt({
@@ -150,5 +154,16 @@ def human_review_node(state: dict) -> dict:
         except (ValueError, IndexError):
             pass  # malformed "extend to" clause — keep max_rounds unchanged rather than crash the run
 
-    status = "stopped_by_human" if decision_str.lower().startswith("stop") else "running"
+    is_stop = decision_str.lower().startswith("stop")
+    if not is_stop and state["round"] > new_max_rounds:
+        print(
+            f"[human_review] decision {decision_str!r} did not raise max_rounds past the "
+            f"current round ({state['round']}) — the round budget is still exhausted, so "
+            "continuing would just re-hit this same review next round. Treating this as "
+            "'stop' instead of looping forever. Use \"continue, extend to N\" (with N >= "
+            f"{state['round']}) to actually keep going."
+        )
+        is_stop = True
+
+    status = "stopped_by_human" if is_stop else "running"
     return {"human_decision": decision_str, "max_rounds": new_max_rounds, "status": status}
