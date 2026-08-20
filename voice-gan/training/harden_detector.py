@@ -11,15 +11,36 @@ them with the frozen frontend, and fine-tunes the detector's classifier head
 (warm-started from the previous round's checkpoint, not from scratch) on a
 mix of:
   - the fresh hard negatives (label=spoof)
-  - a resampled "replay" batch of the original cached train embeddings
-    (label=whatever they actually are), so hardening against this round's
-    generator doesn't overwrite what the detector already learned from the
-    real ASVspoof5 train set (catastrophic forgetting) — see
-    configs/adversarial.yaml `detector_hardening.n_replay_real`.
+  - a resampled "replay" batch of real audio (label=whatever it actually
+    is), so hardening against this round's generator doesn't overwrite what
+    the detector already learned from the real ASVspoof5 train set
+    (catastrophic forgetting) — see configs/adversarial.yaml
+    `detector_hardening.n_replay_real`.
 
 Only the classifier head is trained here, same as train_detector.py — the
 frontend stays frozen throughout the whole project (configs/model.yaml
 `frontend.freeze`).
+
+Acoustic-domain augmentation (configs/adversarial.yaml's `augmentation`
+section, see data/augmentation.py): when enabled, both the fresh hard
+negatives and the replayed real audio are randomly perturbed (additive
+noise, gain, optional lowpass) before being embedded, so the detector
+doesn't just learn "clean recording = bonafide." This is a "loop-only"
+augmentation branch — `detector_best.pt` stays the shared, unaugmented
+starting checkpoint across every branch; only what happens inside this loop
+changes.
+
+When augmentation is DISABLED (the default, and what every real Colab run
+before this branch used), replay uses the original fast path — reading
+directly from `extract_embeddings.py`'s pre-cached train-embedding memmap,
+no raw audio or frontend forward pass needed. When augmentation is ENABLED,
+replay instead re-loads raw audio for the sampled rows via
+`data.dataset.ASVspoof5Dataset` and re-embeds it live through the frozen
+frontend each round (still cheap — a frozen-frontend forward pass over
+`n_replay_real` short clips, not training) — this requires the real
+ASVspoof5 `train` split's audio to be downloaded/extracted locally, not just
+its cached embeddings; see the adversarial-loop notebook's updated
+data-setup cell.
 
 Reports the new fooling rate (fraction of a held-out set of freshly
 generated clips the hardened detector now scores as bonafide) at the end,
@@ -51,7 +72,8 @@ from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.dataset import load_configs
+from data.augmentation import augment_batch
+from data.dataset import ASVspoof5Dataset, load_configs
 from eval.metrics import compute_eer
 from models.detector.classifier import Detector
 from models.detector.frontend import SpeechFrontend
@@ -119,26 +141,49 @@ def generate_hard_negatives(
     return paths
 
 
-def embed_clips(paths: "list[str]", frontend: SpeechFrontend, device: str, target_sr: int, max_samples: int, batch_size: int = 16) -> torch.Tensor:
-    """Runs the frozen frontend over freshly generated clips, matching the
-    exact preprocessing extract_embeddings.py applies to real ASVspoof5
-    audio (resample, mono-mix, fixed-length crop/pad) so the resulting
-    embeddings are directly comparable to / mixable with the cached ones."""
+def _embed_waveforms(waveforms: torch.Tensor, frontend: SpeechFrontend, device: str, batch_size: int = 16) -> torch.Tensor:
+    """Runs the frozen frontend over an already-loaded (and, if applicable,
+    already-augmented) batch of fixed-length waveforms, shape
+    [n, samples]. Shared by embed_clips (fresh hard negatives, loaded from
+    disk) and sample_and_embed_replay (real audio, loaded via
+    ASVspoof5Dataset) so both paths embed identically."""
     frontend.eval()
     all_embeddings = []
     with torch.no_grad():
-        for start in range(0, len(paths), batch_size):
-            batch_paths = paths[start:start + batch_size]
-            batch = torch.stack([_load_and_fix_length(p, target_sr, max_samples) for p in batch_paths]).to(device)
+        for start in range(0, waveforms.shape[0], batch_size):
+            batch = waveforms[start:start + batch_size].to(device)
             embeddings = frontend(batch)  # [batch, frames, hidden_dim]
             all_embeddings.append(embeddings.cpu())
     return torch.cat(all_embeddings, dim=0)
 
 
+def embed_clips(
+    paths: "list[str]", frontend: SpeechFrontend, device: str, target_sr: int, max_samples: int,
+    batch_size: int = 16, augment_cfg: "dict | None" = None, rng: "random.Random | None" = None,
+) -> torch.Tensor:
+    """Runs the frozen frontend over freshly generated clips, matching the
+    exact preprocessing extract_embeddings.py applies to real ASVspoof5
+    audio (resample, mono-mix, fixed-length crop/pad) so the resulting
+    embeddings are directly comparable to / mixable with the cached ones.
+
+    If augment_cfg is given (configs/adversarial.yaml's `augmentation`
+    section, with `enabled: true`), each clip is randomly perturbed (see
+    data/augmentation.py) before embedding — applied to the hard negatives
+    too, not just the replayed real audio, so the detector also learns to
+    spot this round's generator under noisy/channel-varied conditions, not
+    only its clean default output."""
+    waveforms = torch.stack([_load_and_fix_length(p, target_sr, max_samples) for p in paths])
+    if augment_cfg and augment_cfg.get("enabled"):
+        waveforms = augment_batch(waveforms, target_sr, rng, augment_cfg)
+    return _embed_waveforms(waveforms, frontend, device, batch_size)
+
+
 def sample_replay_embeddings(cache_prefix: str, n: int, rng: random.Random) -> "tuple[torch.Tensor, torch.Tensor]":
     """Draws n random rows from the cached train-embeddings memmap
     (training/extract_embeddings.py's output) as the catastrophic-forgetting
-    guard — see module docstring."""
+    guard — see module docstring. Fast path, used when augmentation is
+    disabled (the default, and what every prior real Colab run used) — see
+    sample_and_embed_replay for the augmentation-enabled equivalent."""
     with open(f"{cache_prefix}_meta.json") as f:
         meta = json.load(f)
     total = meta["n"]
@@ -152,6 +197,27 @@ def sample_replay_embeddings(cache_prefix: str, n: int, rng: random.Random) -> "
     idx = rng.sample(range(total), min(n, total))
     replay_embeddings = torch.from_numpy(np.array(embeddings[idx], dtype=np.float32))
     replay_labels = labels[idx]
+    return replay_embeddings, replay_labels
+
+
+def sample_and_embed_replay(
+    data_cfg: dict, model_cfg: dict, frontend: SpeechFrontend, device: str,
+    n: int, rng: random.Random, augment_cfg: dict,
+) -> "tuple[torch.Tensor, torch.Tensor]":
+    """Augmentation-enabled equivalent of sample_replay_embeddings: instead
+    of reading pre-cached (unaugmented) embeddings, re-loads raw audio for n
+    random `train`-split rows via ASVspoof5Dataset, perturbs it (see
+    data/augmentation.py), and embeds it live through the frozen frontend.
+    Still cheap — a frozen-frontend forward pass over n short clips, not
+    training — but requires the real ASVspoof5 `train` split's audio to be
+    downloaded/extracted locally (not just its cached embeddings); raises a
+    clear error via ASVspoof5Dataset's own check if it isn't."""
+    dataset = ASVspoof5Dataset(data_cfg, model_cfg, split="train", random_crop=False)
+    idx = rng.sample(range(len(dataset)), min(n, len(dataset)))
+    waveforms, labels = zip(*(dataset[i] for i in idx))
+    waveforms = augment_batch(torch.stack(waveforms), dataset.target_sr, rng, augment_cfg)
+    replay_embeddings = _embed_waveforms(waveforms, frontend, device)
+    replay_labels = torch.stack(labels)
     return replay_embeddings, replay_labels
 
 
@@ -190,11 +256,17 @@ def main():
     with open(args.adversarial_config) as f:
         full_adv_cfg = yaml.safe_load(f)
     det_cfg = full_adv_cfg["detector_hardening"]
+    # Augmentation section is optional — missing entirely (every config from
+    # before this branch) or `enabled: false` both mean "exact original
+    # behavior," so the augmentation-off baseline stays bit-for-bit
+    # comparable to every prior real Colab run. See data/augmentation.py.
+    augment_cfg = full_adv_cfg.get("augmentation", {"enabled": False})
     top_seed = full_adv_cfg.get("seed", 42)
     rng = random.Random(top_seed + 1000 + args.round)  # +1000: distinct stream from finetune_generator.py's rng, same round
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[harden-detector] round {args.round} | device: {device}")
+    print(f"[harden-detector] round {args.round} | device: {device} | augmentation: "
+          f"{'enabled' if augment_cfg.get('enabled') else 'disabled'}")
 
     # --- this round's fine-tuned generator (inference only, full 32-step quality) ---
     generator = GeneratorWrapper(
@@ -227,16 +299,30 @@ def main():
     print(f"[harden-detector] warm-started from {args.detector_checkpoint_in} (epoch {ckpt['epoch']}, prior val EER {ckpt.get('val_eer', float('nan')):.2%})")
 
     # --- build this round's small mixed training set ---
-    hard_negative_embeddings = embed_clips(hard_negative_paths, frontend, device, target_sr, max_samples)
+    # Hard negatives get augmented (if enabled) right here, after F5-TTS
+    # synthesis and before embedding — the detector then also learns to spot
+    # this round's generator under noisy/channel-varied conditions, not just
+    # its clean default output.
+    hard_negative_embeddings = embed_clips(
+        hard_negative_paths, frontend, device, target_sr, max_samples, augment_cfg=augment_cfg, rng=rng,
+    )
     hard_negative_labels = torch.zeros(hard_negative_embeddings.shape[0])  # spoof = 0
 
-    cache_prefix = os.path.join(model_cfg["paths"]["embeddings_cache_dir"], "train")
-    if not os.path.exists(f"{cache_prefix}_meta.json"):
-        raise FileNotFoundError(
-            f"{cache_prefix}_meta.json not found — run training/extract_embeddings.py --split train first "
-            "(needed for the real-embedding replay sample, see module docstring)."
+    if augment_cfg.get("enabled"):
+        # Augmentation-enabled path: re-load raw `train`-split audio and embed
+        # it live (perturbed) each round, instead of reading the unaugmented
+        # cached embeddings — see sample_and_embed_replay's docstring for why.
+        replay_embeddings, replay_labels = sample_and_embed_replay(
+            data_cfg, model_cfg, frontend, device, det_cfg["n_replay_real"], rng, augment_cfg,
         )
-    replay_embeddings, replay_labels = sample_replay_embeddings(cache_prefix, det_cfg["n_replay_real"], rng)
+    else:
+        cache_prefix = os.path.join(model_cfg["paths"]["embeddings_cache_dir"], "train")
+        if not os.path.exists(f"{cache_prefix}_meta.json"):
+            raise FileNotFoundError(
+                f"{cache_prefix}_meta.json not found — run training/extract_embeddings.py --split train first "
+                "(needed for the real-embedding replay sample, see module docstring)."
+            )
+        replay_embeddings, replay_labels = sample_replay_embeddings(cache_prefix, det_cfg["n_replay_real"], rng)
 
     all_embeddings = torch.cat([hard_negative_embeddings, replay_embeddings], dim=0)
     all_labels = torch.cat([hard_negative_labels, replay_labels], dim=0)

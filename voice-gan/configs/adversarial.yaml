@@ -52,7 +52,21 @@ detector_hardening:
   batch_size: 32
   learning_rate: 0.0005     # smaller than the original from-scratch 0.001 — this is incremental hardening of an already-trained head, not training from scratch
   val_fraction: 0.15
-  fooling_rate_threshold: 0.5   # not used by harden_detector.py itself — this is the conditional-routing threshold graph/nodes.py reads to decide harden_detector vs harden_generator next round; kept here so both nodes' knobs live in one file
+  fooling_rate_threshold: 0.1   # not used by harden_detector.py itself — this is the conditional-routing threshold graph/nodes.py reads to decide harden_detector vs harden_generator next round; kept here so both nodes' knobs live in one file
+
+# The "loop-only" acoustic-augmentation branch (see data/augmentation.py for
+# the full rationale and the exact torchaudio ops used). `enabled: false`
+# reproduces every prior real Colab run's exact behavior bit-for-bit — this
+# whole section is a no-op when false, so switching branches is just this
+# one flag. Set true on the augmentation branch; leave false on main so the
+# 26-round baseline stays reproducible.
+augmentation:
+  enabled: true
+  apply_prob: 0.5              # fraction of clips perturbed at all — not every clip, so the detector still sees a clean-audio mix too
+  snr_db_range: [5.0, 20.0]    # additive-noise SNR, randomized per perturbed clip — lower = noisier
+  gain_db_range: [-6.0, 6.0]   # random gain/volume perturbation, applied to every perturbed clip
+  lowpass_prob: 0.3            # fraction of perturbed clips that also get a lowpass filter (narrower-channel simulation)
+  lowpass_cutoff_hz_range: [2000.0, 7000.0]
 
 paths:
   hard_negatives_dir: /content/asvspoof5_hard_negatives   # local/ephemeral, like generator.yaml's output_dir — regenerated fresh every round
