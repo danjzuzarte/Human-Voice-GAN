@@ -132,7 +132,7 @@ def human_review_node(state: dict) -> dict:
       "continue, extend to N"    — also raises max_rounds to N first, so there's
                                     real room to keep going
       "stop"                     — end the run here, keep the current checkpoints
-    Anything not starting with "stop" is treated as "continue" — see graph/graph.py's route_after_human_review.
+    Anything not starting with "stop" is treated as "continue" — see graph/graph.py's route_after_human_review."""
     from langgraph.types import interrupt
 
     decision = interrupt({
