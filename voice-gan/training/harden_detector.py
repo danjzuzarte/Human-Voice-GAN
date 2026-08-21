@@ -47,6 +47,22 @@ generated clips the hardened detector now scores as bonafide) at the end,
 which is what graph/nodes.py's conditional edge reads to decide whether
 another harden_generator round is needed.
 
+Per-side conditional routing (configs/adversarial.yaml's
+`routing.conditional`, see graph/graph.py's decide_side_node): when a
+round's graph/nodes.py decides the *generator* is this round's active side
+(i.e. harden_generator ran, but the detector shouldn't be touched this
+round), this script is called with `--eval-only`. That skips the
+classifier-head training loop completely — the detector's weights are
+carried over unmodified — but still generates fresh hard negatives from
+--generator-checkpoint and evaluates the CURRENT, untouched detector against
+them (plus a fresh replay mix), so fooling_rate_history/val_eer_history
+still get a real per-round reading either way, and
+route_after_harden_detector (graph/graph.py) doesn't need to know or care
+which mode produced it. See `main()`'s `if args.eval_only:` branch. This is
+the "loop-only" per-side routing branch — same relationship to the
+always-both baseline as the augmentation flag: disabled (the default)
+reproduces the original always-train behavior bit-for-bit.
+
 Usage:
     python training/harden_detector.py --data-config configs/data.yaml \\
         --model-config configs/model.yaml --generator-config configs/generator.yaml \\
@@ -248,6 +264,15 @@ def main():
     parser.add_argument("--detector-checkpoint-in", required=True, help="previous round's detector_best.pt (or the original trained detector, for round 1)")
     parser.add_argument("--detector-checkpoint-out", required=True)
     parser.add_argument("--round", type=int, default=1)
+    parser.add_argument(
+        "--eval-only", action="store_true",
+        help="Per-side conditional routing (see graph/graph.py's decide_side_node): skip the "
+             "classifier-head training loop entirely — the detector's weights are carried over UNCHANGED "
+             "this round. Still generates fresh hard negatives from --generator-checkpoint (the round's "
+             "generator, whether or not it was itself just fine-tuned this round) and reports a real "
+             "fooling_rate/val_eer reading against the current, untouched detector, so the loop still has a "
+             "genuine per-round metric to route on even on a round where only the generator side was active.",
+    )
     args = parser.parse_args()
 
     data_cfg, model_cfg = load_configs(args.data_config, args.model_config)
@@ -266,7 +291,8 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[harden-detector] round {args.round} | device: {device} | augmentation: "
-          f"{'enabled' if augment_cfg.get('enabled') else 'disabled'}")
+          f"{'enabled' if augment_cfg.get('enabled') else 'disabled'} | mode: "
+          f"{'EVAL-ONLY (detector weights unchanged this round)' if args.eval_only else 'train'}")
 
     # --- this round's fine-tuned generator (inference only, full 32-step quality) ---
     generator = GeneratorWrapper(
@@ -331,74 +357,124 @@ def main():
         f"+ {replay_embeddings.shape[0]} replayed real embeddings = {all_embeddings.shape[0]} total"
     )
 
-    # Stratified, not a plain random slice — this round's training set is
-    # small (tens to low hundreds of rows, unlike the full cached train
-    # split), so a naive random val split has a real chance of landing on a
-    # single-class val set by chance, which makes compute_eer's ROC curve
-    # undefined (caught via real-execution testing: "All-NaN slice
-    # encountered" from a val split that came up all-spoof). Falls back to a
-    # plain random split only in the degenerate case where the whole mixed
-    # set has just one class already (val EER is meaningless either way then
-    # — not something stratification can fix).
-    label_values = all_labels.numpy()
-    if len(set(label_values.tolist())) > 1:
-        train_idx, val_idx = train_test_split(
-            range(all_embeddings.shape[0]), test_size=det_cfg["val_fraction"],
-            stratify=label_values, random_state=top_seed + args.round,
-        )
+    if args.eval_only:
+        # Per-side conditional routing: this round's generator side was the
+        # one that got attention (see finetune_generator.py / graph/graph.py's
+        # decide_side_node) — the detector's weights stay exactly as loaded
+        # from --detector-checkpoint-in. We still evaluate the CURRENT,
+        # untouched detector against this round's freshly-built mixed set
+        # (all of it, not a train/val split — there's no training to hold
+        # anything out from) so val_eer_history still gets a real, comparable
+        # per-round reading instead of a gap or a stale carried-over number.
+        #
+        # Same "All-NaN slice" failure mode the training path's stratified
+        # split guards against below can hit here too, if this round's small
+        # mix happens to have only one class — compute_eer's ROC curve is
+        # undefined with no positive (or no negative) examples. Real
+        # production round sizes (40 hard negatives + hundreds of replayed
+        # real clips, mixed spoof/bonafide) make this very unlikely in
+        # practice, but it costs nothing to guard rather than let a rare
+        # unlucky round crash the whole loop.
+        if len(set(all_labels.numpy().tolist())) > 1:
+            full_loader = DataLoader(
+                MixedEmbeddingDataset(all_embeddings, all_labels), batch_size=det_cfg["batch_size"], shuffle=False,
+            )
+            best_eer, eval_only_accuracy = evaluate(model, full_loader, device)
+            print(
+                f"[harden-detector] eval-only round — detector weights unchanged | "
+                f"eval EER={best_eer:.2%} | eval acc={eval_only_accuracy:.2%} (against this round's fresh "
+                f"{all_embeddings.shape[0]}-clip mix, no training)"
+            )
+        else:
+            best_eer = ckpt.get("val_eer", float("nan"))
+            print(
+                f"[harden-detector] eval-only round — this round's mixed set has only one class present, "
+                f"EER is undefined here; carrying forward the prior checkpoint's val_eer ({best_eer:.2%}) instead "
+                "of crashing on an all-NaN ROC curve."
+            )
+
+        os.makedirs(os.path.dirname(args.detector_checkpoint_out), exist_ok=True)
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "hidden_dim": ckpt["hidden_dim"],
+            "classifier_config": ckpt["classifier_config"],
+            "epoch": ckpt["epoch"],  # unchanged — no training epochs ran this round
+            "val_eer": best_eer,
+            "round": args.round,
+            "hardened_against_generator_checkpoint": args.generator_checkpoint,
+            "eval_only": True,
+        }, args.detector_checkpoint_out)
+        print(f"[harden-detector] saved carried-over (unmodified) detector -> {args.detector_checkpoint_out}")
     else:
-        rng_split = random.Random(top_seed + args.round)
-        idx = list(range(all_embeddings.shape[0]))
-        rng_split.shuffle(idx)
-        val_size = max(1, int(len(idx) * det_cfg["val_fraction"]))
-        val_idx, train_idx = idx[:val_size], idx[val_size:]
-    train_embeddings, val_embeddings = all_embeddings[train_idx], all_embeddings[val_idx]
-    train_labels, val_labels = all_labels[train_idx], all_labels[val_idx]
+        # Stratified, not a plain random slice — this round's training set is
+        # small (tens to low hundreds of rows, unlike the full cached train
+        # split), so a naive random val split has a real chance of landing on a
+        # single-class val set by chance, which makes compute_eer's ROC curve
+        # undefined (caught via real-execution testing: "All-NaN slice
+        # encountered" from a val split that came up all-spoof). Falls back to a
+        # plain random split only in the degenerate case where the whole mixed
+        # set has just one class already (val EER is meaningless either way then
+        # — not something stratification can fix).
+        label_values = all_labels.numpy()
+        if len(set(label_values.tolist())) > 1:
+            train_idx, val_idx = train_test_split(
+                range(all_embeddings.shape[0]), test_size=det_cfg["val_fraction"],
+                stratify=label_values, random_state=top_seed + args.round,
+            )
+        else:
+            rng_split = random.Random(top_seed + args.round)
+            idx = list(range(all_embeddings.shape[0]))
+            rng_split.shuffle(idx)
+            val_size = max(1, int(len(idx) * det_cfg["val_fraction"]))
+            val_idx, train_idx = idx[:val_size], idx[val_size:]
+        train_embeddings, val_embeddings = all_embeddings[train_idx], all_embeddings[val_idx]
+        train_labels, val_labels = all_labels[train_idx], all_labels[val_idx]
 
-    train_loader = DataLoader(
-        MixedEmbeddingDataset(train_embeddings, train_labels), batch_size=det_cfg["batch_size"], shuffle=True,
-    )
-    val_loader = DataLoader(
-        MixedEmbeddingDataset(val_embeddings, val_labels), batch_size=det_cfg["batch_size"], shuffle=False,
-    )
+        train_loader = DataLoader(
+            MixedEmbeddingDataset(train_embeddings, train_labels), batch_size=det_cfg["batch_size"], shuffle=True,
+        )
+        val_loader = DataLoader(
+            MixedEmbeddingDataset(val_embeddings, val_labels), batch_size=det_cfg["batch_size"], shuffle=False,
+        )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=det_cfg["learning_rate"])
-    criterion = nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=det_cfg["learning_rate"])
+        criterion = nn.BCEWithLogitsLoss()
 
-    best_eer = float("inf")
-    best_state_dict = model.state_dict()
-    for epoch in range(1, det_cfg["epochs"] + 1):
-        model.train()
-        total_loss = 0.0
-        for embeddings, labels in train_loader:
-            embeddings, labels = embeddings.to(device), labels.to(device)
-            optimizer.zero_grad()
-            logits = model(embeddings)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * embeddings.size(0)
+        best_eer = float("inf")
+        best_state_dict = model.state_dict()
+        for epoch in range(1, det_cfg["epochs"] + 1):
+            model.train()
+            total_loss = 0.0
+            for embeddings, labels in train_loader:
+                embeddings, labels = embeddings.to(device), labels.to(device)
+                optimizer.zero_grad()
+                logits = model(embeddings)
+                loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item() * embeddings.size(0)
 
-        train_loss = total_loss / train_embeddings.shape[0]
-        eer, accuracy = evaluate(model, val_loader, device)
-        print(f"[harden-detector] epoch {epoch:02d}/{det_cfg['epochs']} | loss={train_loss:.4f} | val EER={eer:.2%} | val acc={accuracy:.2%}")
-        if eer < best_eer:
-            best_eer = eer
-            best_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+            train_loss = total_loss / train_embeddings.shape[0]
+            eer, accuracy = evaluate(model, val_loader, device)
+            print(f"[harden-detector] epoch {epoch:02d}/{det_cfg['epochs']} | loss={train_loss:.4f} | val EER={eer:.2%} | val acc={accuracy:.2%}")
+            if eer < best_eer:
+                best_eer = eer
+                best_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
 
-    model.load_state_dict(best_state_dict)
+        model.load_state_dict(best_state_dict)
 
-    os.makedirs(os.path.dirname(args.detector_checkpoint_out), exist_ok=True)
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "hidden_dim": ckpt["hidden_dim"],
-        "classifier_config": ckpt["classifier_config"],
-        "epoch": ckpt["epoch"] + det_cfg["epochs"],
-        "val_eer": best_eer,
-        "round": args.round,
-        "hardened_against_generator_checkpoint": args.generator_checkpoint,
-    }, args.detector_checkpoint_out)
-    print(f"[harden-detector] saved hardened detector -> {args.detector_checkpoint_out} (val EER {best_eer:.2%})")
+        os.makedirs(os.path.dirname(args.detector_checkpoint_out), exist_ok=True)
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "hidden_dim": ckpt["hidden_dim"],
+            "classifier_config": ckpt["classifier_config"],
+            "epoch": ckpt["epoch"] + det_cfg["epochs"],
+            "val_eer": best_eer,
+            "round": args.round,
+            "hardened_against_generator_checkpoint": args.generator_checkpoint,
+            "eval_only": False,
+        }, args.detector_checkpoint_out)
+        print(f"[harden-detector] saved hardened detector -> {args.detector_checkpoint_out} (val EER {best_eer:.2%})")
 
     # --- report the new fooling rate: a FRESH held-out batch from the same
     # generator (not the clips just trained on) scored by the just-hardened
