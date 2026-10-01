@@ -88,7 +88,7 @@ def download_protocols(cfg: dict) -> Path:
 
 
 def download_split(cfg: dict, split: str, all_shards: bool = False) -> list[Path]:
-    """Download (and extract) the configured tar shards for a split ('train' or 'dev')."""
+    """Download (and extract) the configured tar shards for a split ('train', 'dev', or 'eval')."""
     repo_id = cfg["hf_repo_id"]
     repo_type = cfg["hf_repo_type"]
     raw_dir = cfg["paths"]["raw_download_dir"]
@@ -119,7 +119,7 @@ def download_split(cfg: dict, split: str, all_shards: bool = False) -> list[Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/data.yaml")
-    parser.add_argument("--split", choices=["train", "dev"], default=None)
+    parser.add_argument("--split", choices=["train", "dev", "eval"], default=None)
     parser.add_argument("--all-shards", action="store_true", help="Download every shard for the split, not just the configured subset")
     parser.add_argument("--protocols-only", action="store_true", help="Only download the protocol/label files, not audio")
     args = parser.parse_args()
