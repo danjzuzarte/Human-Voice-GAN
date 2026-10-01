@@ -98,8 +98,13 @@ def main():
             final_state = app.get_state(config).values
             print(f"\n[run-loop] === run finished: status={final_state['status']} "
                   f"after {len(final_state['fooling_rate_history'])} round(s) ===")
-            for i, (fr, eer) in enumerate(zip(final_state["fooling_rate_history"], final_state["val_eer_history"]), 1):
-                print(f"[run-loop]   round {i}: fooling_rate={fr:.1%}  val_eer={eer:.2%}")
+            # active_side_history is only meaningful when configs/adversarial.yaml's
+            # routing.conditional is true (the per-side routing branch) — it's an
+            # empty list on the always-both baseline, so this zips in "both" as a
+            # filler rather than crashing/misaligning on that path.
+            sides = final_state.get("active_side_history") or ["both"] * len(final_state["fooling_rate_history"])
+            for i, (fr, eer, side) in enumerate(zip(final_state["fooling_rate_history"], final_state["val_eer_history"], sides), 1):
+                print(f"[run-loop]   round {i}: fooling_rate={fr:.1%}  val_eer={eer:.2%}  active_side={side}")
             print(f"[run-loop] final detector checkpoint: {final_state['detector_checkpoint']}")
             print(f"[run-loop] final generator checkpoint: {final_state['generator_checkpoint']}")
             break

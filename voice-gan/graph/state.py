@@ -40,3 +40,8 @@ class AdversarialLoopState(TypedDict):
     # --- loop status / human-in-the-loop ---
     status: str                # "running" | "converged" | "max_rounds_reached" | "stopped_by_human" | "awaiting_human_review"
     human_decision: "str | None"  # set by the caller resuming an interrupt() — see graph/nodes.py human_review_node
+
+    # --- per-side conditional routing (configs/adversarial.yaml
+    # `routing.conditional`, see graph/graph.py's decide_side_node) ---
+    active_side: "str | None"       # this round's active side: "generator" | "detector" | None (None = routing.conditional is false, i.e. always-both)
+    active_side_history: list       # list[str], oldest first — which side was actually trained each completed round ("generator" | "detector" | "both")

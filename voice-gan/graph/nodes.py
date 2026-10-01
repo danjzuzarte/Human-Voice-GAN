@@ -45,6 +45,48 @@ def _read_yaml(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def decide_side_node(state: dict) -> dict:
+    """Per-side conditional routing (configs/adversarial.yaml's
+    `routing.conditional`, see graph/graph.py's module docstring for the
+    full graph shape). Pure decision logic, no subprocess — runs at the top
+    of every round, before either training node.
+
+    When `routing.conditional` is false (the default), returns
+    active_side=None: graph/graph.py's route_after_decide_side always sends
+    None to "run_generator", so the graph falls straight through to
+    harden_generator then harden_detector every round, byte-for-byte the
+    original always-both behavior — this node is a genuine no-op on that
+    path, not a different codepath that could drift from it.
+
+    When true, decides which single side gets trained this round:
+      - Round 1 (no fooling_rate_history yet): always "generator" — mirrors
+        the original loop's own round-1 ordering, since there's no signal
+        yet to route on.
+      - Otherwise: "detector" if last round's fooling_rate was at/above
+        `routing.generator_winning_threshold` (the generator is fooling the
+        detector often enough that it's the one that needs work), else
+        "generator" (the detector's already ahead — give the generator more
+        room). This is the standard "train whichever side is currently
+        losing" GAN-balancing heuristic, evaluated fresh each round off
+        fooling_rate (the metric this project has established is
+        trustworthy in-loop — val_eer is not used for this decision)."""
+    adv_cfg = _read_yaml(state["adversarial_config"])
+    routing_cfg = adv_cfg.get("routing", {})
+    if not routing_cfg.get("conditional", False):
+        return {"active_side": None}
+
+    history = state["fooling_rate_history"]
+    if not history:
+        side = "generator"
+    else:
+        threshold = routing_cfg.get("generator_winning_threshold", 0.5)
+        side = "detector" if history[-1] >= threshold else "generator"
+
+    signal = f"last fooling_rate: {history[-1]:.1%}" if history else "no history yet, round 1"
+    print(f"[decide-side] round {state['round']} | {signal} -> active side this round: {side}")
+    return {"active_side": side}
+
+
 def harden_generator_node(state: dict) -> dict:
     """Runs training/finetune_generator.py for the current round — adversarially
     fine-tunes the generator's transformer weights against state['detector_checkpoint'].
@@ -80,6 +122,19 @@ def harden_detector_node(state: dict) -> dict:
     reads back the round's fooling_rate / val_eer from the
     `.round_result.json` sidecar file harden_detector.py writes.
 
+    Per-side conditional routing: if decide_side_node set
+    state['active_side'] to "generator" this round (i.e. only the generator
+    was trained; the detector sits this round out), this call passes
+    `--eval-only` — the detector's weights stay unmodified, but a real
+    fooling_rate/val_eer reading is still produced against the current
+    detector (see training/harden_detector.py's `--eval-only` docstring),
+    so route_after_harden_detector's convergence/stuck-rounds logic works
+    identically regardless of which mode produced the round's numbers.
+    active_side is None on the always-both baseline (routing.conditional:
+    false) and "detector" on a round decide_side_node picked the detector
+    for — neither of those passes --eval-only, so the detector always
+    trains for real in both of those cases.
+
     Advances state['round'] by 1 — by the time this node returns, 'round'
     means "the next round to run", and len(fooling_rate_history) means
     "rounds completed so far". See graph/graph.py's routing function for how
@@ -89,6 +144,7 @@ def harden_detector_node(state: dict) -> dict:
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"detector_round{state['round']}.pt")
 
+    active_side = state.get("active_side")  # None (baseline) | "generator" | "detector"
     args = [
         "--data-config", state["data_config"],
         "--model-config", state["model_config"],
@@ -99,6 +155,8 @@ def harden_detector_node(state: dict) -> dict:
         "--detector-checkpoint-out", out_path,
         "--round", str(state["round"]),
     ]
+    if active_side == "generator":
+        args.append("--eval-only")
     _run_script("training/harden_detector.py", args)
 
     result_path = out_path + ".round_result.json"
@@ -109,6 +167,7 @@ def harden_detector_node(state: dict) -> dict:
         "detector_checkpoint": out_path,
         "fooling_rate_history": state["fooling_rate_history"] + [result["fooling_rate"]],
         "val_eer_history": state["val_eer_history"] + [result["val_eer"]],
+        "active_side_history": state.get("active_side_history", []) + [active_side or "both"],
         "round": state["round"] + 1,
         "status": "running",
     }
@@ -132,7 +191,8 @@ def human_review_node(state: dict) -> dict:
       "continue, extend to N"    — also raises max_rounds to N first, so there's
                                     real room to keep going
       "stop"                     — end the run here, keep the current checkpoints
-    Anything not starting with "stop" is treated as "continue" — see graph/graph.py's route_after_human_review."""
+    Anything not starting with "stop" is treated as "continue" — see
+    graph/graph.py's route_after_human_review."""
     from langgraph.types import interrupt
 
     decision = interrupt({

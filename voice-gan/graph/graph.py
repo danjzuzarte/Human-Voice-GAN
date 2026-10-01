@@ -16,39 +16,59 @@ against this current API.
 
 Loop shape (deliberately simple — see the design note below):
 
-    START -> harden_generator -> harden_detector -> [route] -> ...
-                  ^                                     |
-                  |------------- "continue" -------------
-                                                          |
-                                            "converged" -> END
-                                                          |
-                                      "needs_review" -> human_review -> [route] -> ...
-                                                                            |          |
-                                                                     "continue"      "stop"
-                                                                            |          |
-                                                                     harden_generator  END
+    START -> decide_side -> [run_generator]  -> harden_generator -> harden_detector -> [route] -> ...
+                          -> [skip_generator] -------------------->      ^                |
+                                                                          |----"continue"---
+                                                                                             |
+                                                                               "converged" -> mark_converged -> END
+                                                                                             |
+                                                                       "needs_review" -> human_review -> [route] -> ...
+                                                                                                             |          |
+                                                                                                      "continue"      "stop"
+                                                                                                             |          |
+                                                                                                       decide_side     END
 
-Design note (scope honesty): the original design sketch considered routing
-each round to EITHER harden_generator OR harden_detector individually based
-on the current fooling rate (skip whichever side is already winning). This
-implementation always runs both every round (a fixed adversarial pair, like
-a standard GAN step) and reserves the conditional routing for the
-loop-level decision — keep looping, stop (converged), or escalate to a
-human. That's a deliberate simplification: it's easier to reason about,
-test, and resume, and still produces a real
-adversarial arms race round over round. Skipping a side conditionally is a
-plausible later refinement, not something this graph does today.
+Design note (scope honesty): an earlier version of this graph always ran
+both harden_generator and harden_detector every round (a fixed adversarial
+pair, like a standard GAN step) and reserved conditional routing for the
+loop-level decision only — keep looping, stop (converged), or escalate to a
+human. Whether each round trains BOTH sides or only whichever side is
+currently "losing" is now a config-driven choice:
+`configs/adversarial.yaml`'s `routing.conditional` flag. False (the
+default) reproduces the original always-both behavior byte-for-byte —
+decide_side_node returns active_side=None, route_after_decide_side always
+takes the "run_generator" edge, and harden_detector_node never passes
+--eval-only. True routes each round to a single side: decide_side picks it
+(round 1 is always "generator", since there's no fooling-rate history yet
+to route on; every round after that trains whichever side lost the
+fooling-rate exchange last round — see decide_side_node's own docstring in
+graph/nodes.py for the exact rule). The side that sits out a round isn't
+retrained, but harden_detector_node still calls training/harden_detector.py
+(in --eval-only mode when the generator was the active side) so
+fooling_rate_history/val_eer_history get a real per-round reading either
+way — meaning route_after_harden_detector, route_after_human_review, and
+every other part of the loop's convergence/stuck-round logic needed zero
+changes to support this.
 """
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
-from graph.nodes import harden_detector_node, harden_generator_node, human_review_node
+from graph.nodes import decide_side_node, harden_detector_node, harden_generator_node, human_review_node
 from graph.state import AdversarialLoopState
 
 # How many consecutive non-improving rounds (fooling_rate flat or rising)
 # before escalating to human_review instead of blindly continuing — cheap
 # guard against silently burning the whole GPU-hours budget on a stuck run.
 STUCK_ROUNDS_THRESHOLD = 3
+
+
+def route_after_decide_side(state: AdversarialLoopState) -> str:
+    """decide_side_node has already set state['active_side'] by the time
+    this runs. "detector" is the only value that skips harden_generator
+    this round — None (routing.conditional: false) and "generator" both
+    take the normal "run_generator" edge, so the always-both baseline's
+    routing is entirely unaffected by this function's existence."""
+    return "skip_generator" if state.get("active_side") == "detector" else "run_generator"
 
 
 def route_after_harden_detector(state: AdversarialLoopState) -> str:
@@ -82,21 +102,26 @@ def build_graph() -> StateGraph:
     on the result (see build_app() below for the common case)."""
     graph = StateGraph(AdversarialLoopState)
 
+    graph.add_node("decide_side", decide_side_node)
     graph.add_node("harden_generator", harden_generator_node)
     graph.add_node("harden_detector", harden_detector_node)
     graph.add_node("human_review", human_review_node)
     graph.add_node("mark_converged", mark_converged)
 
-    graph.add_edge(START, "harden_generator")
+    graph.add_edge(START, "decide_side")
+    graph.add_conditional_edges(
+        "decide_side", route_after_decide_side,
+        {"run_generator": "harden_generator", "skip_generator": "harden_detector"},
+    )
     graph.add_edge("harden_generator", "harden_detector")
     graph.add_conditional_edges(
         "harden_detector", route_after_harden_detector,
-        {"continue": "harden_generator", "converged": "mark_converged", "needs_review": "human_review"},
+        {"continue": "decide_side", "converged": "mark_converged", "needs_review": "human_review"},
     )
     graph.add_edge("mark_converged", END)
     graph.add_conditional_edges(
         "human_review", route_after_human_review,
-        {"continue": "harden_generator", "stop": END},
+        {"continue": "decide_side", "stop": END},
     )
 
     return graph
@@ -138,4 +163,6 @@ def initial_state(
         "val_eer_history": [],
         "status": "running",
         "human_decision": None,
+        "active_side": None,
+        "active_side_history": [],
     }

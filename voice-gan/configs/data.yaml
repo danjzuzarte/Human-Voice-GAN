@@ -37,9 +37,11 @@ splits:
     available_shards: [a, b, c]
     shards_to_download: [a]        # 1 of 3 shards, enough for validation during training
     protocol_file: ASVspoof5.dev.track_1.tsv
-  # eval (E series, ~85GB) intentionally left unconfigured here — pull this only
-  # for the cross-/in-distribution robustness evaluation stage, and consider
-  # whether the full 681k-utterance set is needed or a stratified sample suffices.
+  eval:
+    shard_pattern: "flac_E_a{letter}.tar"
+    available_shards: [a, b, c, d, e, f, g, h, i, j]
+    shards_to_download: [a]        # start with 1 of 10 shards (~8.5GB, ~68k utterances)
+    protocol_file: ASVspoof5.eval.track_1.tsv
 
 protocols_archive: ASVspoof5_protocols.tar
 codec_config_file: ASVspoof5.codec.config.csv   # not present in this HF mirror — see note above; leave as-is or set to null, the download script handles either
